@@ -6,9 +6,11 @@ white="\033[0m"
 
 out_dir="./out"
 openwrt_dir="./openwrt"
+BOOTLOADER_IMG="$PWD/armbian/beikeyun/others/btld-rk3328.bin"
 rootfs_dir="/media/rootfs"
 loop=
-
+SKIP_MB=16
+BOOT_MB=128
 
 echo  -e "\n贝壳云Openwrt镜像制作工具"
 #检测root权限
@@ -83,24 +85,45 @@ loop=$(sudo losetup -P -f --show *.img)
 
     #MBR引导
 sudo parted -s $loop  mklabel msdos> /dev/null 2>&1
-    #创建分区1/设定主分区
-sudo parted $loop mkpart primary 17 $rootfssize  >/dev/null 2>&1
-    #
-loopp1=${loop}p1 
-    #格式化分区1
-sudo mkfs.ext4 $loopp1 > /dev/null 2>&1
-    #获取分区1UUID
-p1uuid=$(sudo tune2fs -l $loopp1|grep UUID|awk '{print $3}')
+    #创建BOOT分区
+START=$((SKIP_MB * 1024 * 1024))
+END=$((BOOT_MB * 1024 * 1024 + START -1))
+sudo parted $loop mkpart primary ext4 ${START}b ${END}b >/dev/null 2>&1
+    #创建ROOTFS分区
+START=$((END + 1))
+END=$((rootfssize * 1024 * 1024 + START -1))
+sudo parted $loop mkpart primary btrfs ${START}b 100%
+sudo parted $loop print
+
+# mk boot filesystem (ext4)
+BOOT_UUID=$(uuid)
+sudo mkfs.ext4 -U ${BOOT_UUID} -L EMMC_BOOT ${loop}p1
+echo "BOOT UUID IS $BOOT_UUID"
+# mk root filesystem (btrfs)
+ROOTFS_UUID=$(uuid)
+sudo mkfs.btrfs -U ${ROOTFS_UUID} -L EMMC_ROOTFS1 ${loop}p2
+echo "ROOTFS UUID IS $ROOTFS_UUID"
+
+echo "parted ok"
+
+# write bootloader
+echo $PWD
+sudo dd if=${BOOTLOADER_IMG} of=${loop} bs=1 count=446
+sudo dd if=${BOOTLOADER_IMG} of=${loop} bs=512 skip=1 seek=1
+sudo sync
+
     #设定分区目录挂载路径
-rootfs_dir=/media/$p1uuid
+boot_dir=/media/$BOOT_UUID
+rootfs_dir=/media/$ROOTFS_UUID
     #删除重建目录
-sudo rm -rf $rootfs_dir
-sudo mkdir $rootfs_dir
-    #挂载p1分区到新建目录
-    sudo mount -o rw $loopp1 $rootfs_dir
-echo "p1uuid:$p1uuid"
+sudo rm -rf $boot_dir $rootfs_dir
+sudo mkdir $boot_dir $rootfs_dir
+    #挂载分区到新建目录
+sudo mount -t ext4 ${loop}p1 $boot_dir
+sudo mount -t btrfs -o compress=zstd ${loop}p2 $rootfs_dir
     #写入UUID 到fstab
-    sudo echo "UUID=$p1uuid / ext4 defaults,noatime,nodiratime,commit=600,errors=remount-ro 0 1">openwrt/etc/fstab
+    sudo echo "UUID=$BOOT_UUID / btrfs compress=zstd 0 1">openwrt/etc/fstab
+    sudo echo "UUID=$ROOTFS_UUID /boot ext4 noatime,errors=remount-ro 0 2">openwrt/etc/fstab
     sudo echo "tmpfs /tmp tmpfs defaults,nosuid 0 0">>openwrt/etc/fstab
 
 # 拷贝文件到启动镜像
@@ -109,22 +132,26 @@ cd ../
     sudo rm -rf armbian/beikeyun/boot/armbianEnv.txt
     sudo touch armbian/beikeyun/boot/armbianEnv.txt
     #写入UUID到armbianEnv
-    sudo echo "verbosity=7">armbian/beikeyun/boot/armbianEnv.txt
-    sudo echo "overlay_prefix=rockchip">>armbian/beikeyun/boot/armbianEnv.txt
-    sudo echo "rootdev=UUID=$p1uuid">>armbian/beikeyun/boot/armbianEnv.txt
-    sudo echo "rootfstype=ext4">>armbian/beikeyun/boot/armbianEnv.txt
-    sudo echo "fdtfile=rk3328-beikeyun.dtb">>armbian/beikeyun/boot/armbianEnv.txt
-
-    sudo cp -r armbian/beikeyun/boot $out_dir/openwrt/boot
+sudo cat > armbian/beikeyun/boot/armbianEnv.txt <<EOF
+verbosity=7
+overlay_prefix=rockchip
+rootdev=/dev/mmcblk0p2
+rootfstype=btrfs
+rootflags=compress=zstd
+extraargs=usbcore.autosuspend=-1
+extraboardargs=
+fdtfile=rk3328-beikeyun.dtb
+EOF
+    sudo cp -r armbian/beikeyun/boot /media/$BOOT_UUID
     sudo chown -R root:root $out_dir/openwrt/
-    sudo mv $out_dir/openwrt/* $rootfs_dir
+    sudo mv $out_dir/openwrt/* /media/$ROOTFS_UUID
 
 
 
 
 # 取消挂载
 if df -h | grep $rootfs_dir > /dev/null 2>&1 ; then
-    sudo umount $rootfs_dir
+    sudo umount /media/$BOOT_UUID /media/$ROOTFS_UUID
 fi
 
 [ $loopp1 ] && sudo losetup -d $loop
@@ -133,15 +160,5 @@ fi
 sudo rm -rf $boot_dir
 sudo rm -rf $rootfs_dir
 sudo rm -rf $out_dir/openwrt
-
-#添加idb标识以及uboot
-    #获取输出镜像文件名
-img=$(ls -l $out_dir|grep img|awk '{print $9}')
-echo -e  "$green \n 写入idb $white"
-dd if=armbian/beikeyun/others/idb of=$out_dir/$img bs=16 seek=2048 conv=notrunc
-echo -e  "$green \n 写入uboot $white"
-dd if=armbian/beikeyun/others/u-boot of=$out_dir/$img bs=16 seek=524288  conv=notrunc
-
-
 echo -e "$green \n 制作成功, 输出文件夹 --> $out_dir $white"
 
